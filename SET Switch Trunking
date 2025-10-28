@@ -1,0 +1,313 @@
+<#
+.SYNOPSIS
+    Hyper-V switch & VLAN configuration helper (Windows PowerShell 5.1), with all variables as placeholders at the top (no DDA).
+
+.DESCRIPTION
+    - Configure vSwitch (External/Internal/Private) [optional]
+    - Configure Management OS VLAN on vEthernet(<switch>) [optional]
+    - Configure per-VM NIC VLAN Access/Trunk rules by SwitchName and/or AdapterName
+    - Apply NIC extras (MAC spoofing, DHCP/Router guard, Teaming, DeviceNaming, QoS, SR-IOV weight, Static MAC) [optional]
+    - Use -WhatIf when running the script for a safe dry-run
+
+.NOTES
+    Run as Administrator on the Hyper-V host.
+    Compatible with Windows PowerShell 5.1.
+#>
+
+[CmdletBinding(SupportsShouldProcess = $true)]
+param()
+
+# =========================
+# USER VARIABLES (EDIT ME)
+# =========================
+
+# REQUIRED: VM to configure
+$VMName = "<YOUR-VM-NAME>"                    # e.g. "VM-01"
+
+# Inspect-only mode (no changes)
+$ShowOnly = $false                             # $true to only list NICs/VLANs
+
+# Default NIC matching (used where rules don’t specify SwitchName/AdapterName)
+$AdapterNamePattern = "*"                      # e.g. "LAN*", "WAN*"
+$SwitchNamePattern  = "*"                      # e.g. "Proxmox", "MSFT"
+
+# VLAN ACCESS rules (per VM NIC). Each item MAY include SwitchName and/or AdapterName.
+# Example: @{ VlanId=10; SwitchName='Prod-LAN' }
+$AccessRules = @(
+    # @{ VlanId = 10; SwitchName = "Prod-LAN" },
+    # @{ VlanId = 20; AdapterName = "LAN*" }
+)
+
+# VLAN TRUNK rules (per VM NIC). AllowedVlans is a comma list; NativeVlan defaults to 0 if omitted.
+# Example (your case): @{ SwitchName='Proxmox'; AllowedVlans='773,663,883'; NativeVlan=0 }
+$TrunkRules = @(
+    # @{ SwitchName='Proxmox'; AllowedVlans='773,663,883'; NativeVlan=0 },
+    # @{ SwitchName='MSFT';    AllowedVlans='773,663,883'; NativeVlan=0 }
+)
+
+# Clear VLAN mode on adapters matched by default patterns BEFORE applying rules
+$ClearVlanOnMatchedNics = $false
+
+# vSwitch creation (optional). Leave $CreateSwitch = $false if you don’t need it.
+$CreateSwitch              = $false
+$SwitchType                = "External"        # 'External'|'Internal'|'Private'
+$SwitchNameToCreate        = "<NEW-SWITCH-NAME>"     # required if creating
+$NetAdapterNameForVMSwitch = "<HOST-NIC-NAME>"       # required if External; e.g., 'Ethernet 3'
+$AllowManagementOS         = $true
+$EnableSwitchIov           = $false            # Requires SR-IOV capable NIC/BIOS
+
+# Management OS VLAN (optional): choose Access OR Trunk (or neither)
+# For Access: set Access = <int>; e.g., @{ Access = 10 }
+$MgmtOsAccess = $null
+# For Trunk: set AllowedVlans='10,20,30'; NativeVlan=0
+$MgmtOsTrunk  = $null
+
+# NIC extras (optional)
+$EnableMacSpoofing         = $false
+$EnableDhcpGuard           = $false
+$EnableRouterGuard         = $false
+$EnableTeamingOnAdapters   = $false
+$EnableDeviceNaming        = $false
+$BandwidthWeight           = $null             # 0..100 or $null to skip
+$IovWeight                 = $null             # e.g. 100 or $null to skip
+$UseStaticMac              = $false
+$StaticMacAddress          = $null             # e.g. "00155D0ABCDE" (no separators)
+
+# =========================
+# END USER VARIABLES
+# =========================
+
+# ---------- Helpers ----------
+function Write-Section($t){ Write-Host "`n==== $t ====" -ForegroundColor Cyan }
+function Write-Note($t){ Write-Host "[i] $t" -ForegroundColor DarkCyan }
+
+function Assert-VM([string]$name){
+    try { return (Get-VM -Name $name -ErrorAction Stop) }
+    catch { throw "VM '$name' not found: $($_.Exception.Message)" }
+}
+
+function Get-TargetVmNics([string]$name, [string]$switchPat, [string]$adapterPat){
+    @( Get-VMNetworkAdapter -VMName $name |
+        Where-Object { $_.SwitchName -like $switchPat -and $_.Name -like $adapterPat } )
+}
+
+function Show-Overview([string]$name){
+    Write-Section "VM Network Adapters"
+    Get-VMNetworkAdapter -VMName $name |
+      Select-Object VMName,SwitchName,Name,MacAddress | Format-Table -AutoSize
+    Write-Section "VLAN Configuration"
+    Get-VMNetworkAdapterVlan -VMName $name |
+      Select-Object VMNetworkAdapterName, SwitchName, Mode, AllowedVlanIdList, NativeVlanId, VlanId |
+      Format-Table -AutoSize
+}
+
+function Apply-AccessRule {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param($nic, [int]$vlanId)
+    if ($PSCmdlet.ShouldProcess("$($nic.VMName)/$($nic.Name)","Set Access VLAN $vlanId")) {
+        Set-VMNetworkAdapterVlan -VMNetworkAdapter $nic -Access -VlanId $vlanId
+    }
+}
+
+function Apply-TrunkRule {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param($nic, [string]$allowed, [int]$native)
+    if ($PSCmdlet.ShouldProcess("$($nic.VMName)/$($nic.Name)","Set Trunk Allowed=$allowed Native=$native")) {
+        Set-VMNetworkAdapterVlan -VMNetworkAdapter $nic -Trunk -AllowedVlanIdList $allowed -NativeVlanId $native
+    }
+}
+
+function Clear-VlanRule {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param($nic)
+    if ($PSCmdlet.ShouldProcess("$($nic.VMName)/$($nic.Name)","Clear VLAN mode")) {
+        Set-VMNetworkAdapterVlan -VMNetworkAdapter $nic -Untagged
+    }
+}
+
+function Apply-NicExtras {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param($nic)
+
+    $params = @{}
+
+    # Booleans: if set at top, apply On/Off accordingly
+    if ($EnableMacSpoofing -or $EnableMacSpoofing -eq $false) {
+        if ($EnableMacSpoofing) { $params.MacAddressSpoofing = 'On' } else { $params.MacAddressSpoofing = 'Off' }
+    }
+    if ($EnableDhcpGuard -or $EnableDhcpGuard -eq $false) {
+        if ($EnableDhcpGuard) { $params.DhcpGuard = 'On' } else { $params.DhcpGuard = 'Off' }
+    }
+    if ($EnableRouterGuard -or $EnableRouterGuard -eq $false) {
+        if ($EnableRouterGuard) { $params.RouterGuard = 'On' } else { $params.RouterGuard = 'Off' }
+    }
+    if ($EnableTeamingOnAdapters -or $EnableTeamingOnAdapters -eq $false) {
+        if ($EnableTeamingOnAdapters) { $params.AllowTeaming = 'On' } else { $params.AllowTeaming = 'Off' }
+    }
+    if ($EnableDeviceNaming -or $EnableDeviceNaming -eq $false) {
+        if ($EnableDeviceNaming) { $params.DeviceNaming = 'On' } else { $params.DeviceNaming = 'Off' }
+    }
+
+    # Optionals
+    if ($null -ne $BandwidthWeight) { $params.MinimumBandwidthWeight = [int]$BandwidthWeight }
+    if ($null -ne $IovWeight)       { $params.IovWeight              = [int]$IovWeight }
+    if ($UseStaticMac -and $StaticMacAddress) { $params.StaticMacAddress = $StaticMacAddress }
+
+    if ($params.Count -gt 0) {
+        if ($PSCmdlet.ShouldProcess("$($nic.VMName)/$($nic.Name)","Set-VMNetworkAdapter extras")) {
+            Set-VMNetworkAdapter -VMNetworkAdapter $nic @params
+        }
+    }
+}
+
+function Ensure-VSwitch {
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param()
+
+    if (-not $CreateSwitch -and -not $MgmtOsAccess -and -not $MgmtOsTrunk) { return }
+
+    if ($CreateSwitch -and -not $SwitchNameToCreate) {
+        throw "Specify SwitchNameToCreate when using CreateSwitch."
+    }
+
+    $targetSwitchName = $SwitchNameToCreate
+
+    if ($CreateSwitch) {
+        $existing = Get-VMSwitch -Name $SwitchNameToCreate -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-Note "vSwitch '$SwitchNameToCreate' already exists."
+        } else {
+            $p = @{ Name=$SwitchNameToCreate; SwitchType=$SwitchType }
+            if ($SwitchType -eq 'External') {
+                if (-not $NetAdapterNameForVMSwitch) { throw "For External, set NetAdapterNameForVMSwitch." }
+                $p.NetAdapterName    = $NetAdapterNameForVMSwitch
+                $p.AllowManagementOS = [bool]$AllowManagementOS
+            }
+            if ($EnableSwitchIov) { $p.EnableIov = $true }
+
+            if ($PSCmdlet.ShouldProcess("Host","New-VMSwitch $SwitchNameToCreate ($SwitchType)")) {
+                New-VMSwitch @p | Out-Null
+                Write-Host "Created vSwitch '$SwitchNameToCreate' ($SwitchType)." -ForegroundColor Green
+            }
+        }
+    }
+
+    # Configure Management OS VLAN on vEthernet(<switch>) if requested
+    if ($MgmtOsAccess -or $MgmtOsTrunk) {
+        if (-not $targetSwitchName) {
+            Write-Note "Mgmt OS VLAN requested but no SwitchNameToCreate provided—skipping Mgmt OS VLAN config."
+            return
+        }
+
+        $mgmtName = "vEthernet ($targetSwitchName)"
+        $mgmtNic = Get-VMNetworkAdapter -ManagementOS -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -eq $mgmtName }
+
+        if (-not $mgmtNic) {
+            Write-Note "Management OS adapter '$mgmtName' not found. (For External switches, AllowManagementOS must be true.) Skipping Mgmt OS VLAN."
+            return
+        }
+
+        if ($MgmtOsAccess) {
+            if (-not $MgmtOsAccess.Access) { throw "-MgmtOsAccess must be like @{ Access = <VlanId> }" }
+            if ($PSCmdlet.ShouldProcess("ManagementOS/$mgmtName","Access VLAN $($MgmtOsAccess.Access)")) {
+                Set-VMNetworkAdapterVlan -ManagementOS -VMNetworkAdapterName $mgmtName -Access -VlanId ([int]$MgmtOsAccess.Access)
+            }
+        }
+        if ($MgmtOsTrunk) {
+            if (-not $MgmtOsTrunk.AllowedVlans) { throw "-MgmtOsTrunk must include AllowedVlans (comma list). Optional NativeVlan." }
+            $native = 0
+            if ($MgmtOsTrunk.ContainsKey('NativeVlan') -and $null -ne $MgmtOsTrunk.NativeVlan) {
+                $native = [int]$MgmtOsTrunk.NativeVlan
+            }
+            if ($PSCmdlet.ShouldProcess("ManagementOS/$mgmtName","Trunk Allowed=$($MgmtOsTrunk.AllowedVlans) Native=$native")) {
+                Set-VMNetworkAdapterVlan -ManagementOS -VMNetworkAdapterName $mgmtName -Trunk -AllowedVlanIdList $MgmtOsTrunk.AllowedVlans -NativeVlanId $native
+            }
+        }
+    }
+}
+
+function Resolve-Nics-For-Rule {
+    param(
+        [hashtable]$rule,
+        [object[]]$allNics
+    )
+
+    $switchSel  = $SwitchNamePattern
+    if ($rule.ContainsKey('SwitchName') -and $rule.SwitchName) {
+        $switchSel = $rule.SwitchName
+    }
+
+    $adapterSel = $AdapterNamePattern
+    if ($rule.ContainsKey('AdapterName') -and $rule.AdapterName) {
+        $adapterSel = $rule.AdapterName
+    }
+
+    $allNics | Where-Object { $_.SwitchName -like $switchSel -and $_.Name -like $adapterSel }
+}
+
+# =========================
+# Main
+# =========================
+
+# Validate VM
+$vm = Assert-VM $VMName
+
+# Show only?
+if ($ShowOnly) {
+    Show-Overview $VMName
+    return
+}
+
+# Optional: create/ensure vSwitch and configure Mgmt OS VLAN
+Ensure-VSwitch
+
+# Resolve NICs using default patterns (for global extras and clear)
+$allNics = Get-TargetVmNics -name $VMName -switchPat $SwitchNamePattern -adapterPat $AdapterNamePattern
+if (-not $allNics -or $allNics.Count -eq 0) {
+    Write-Note "No VM NICs matched SwitchNamePattern='$SwitchNamePattern' and AdapterNamePattern='$AdapterNamePattern'."
+} else {
+    Write-Section "Matched VM Adapters (pre-rules)"
+    $allNics | Select-Object VMName,SwitchName,Name | Format-Table -AutoSize
+}
+
+# Clear VLAN on matched NICs if requested
+if ($ClearVlanOnMatchedNics -and $allNics.Count -gt 0) {
+    foreach ($nic in $allNics) { Clear-VlanRule $nic }
+}
+
+# Apply Access rules
+foreach ($rule in $AccessRules) {
+    if (-not $rule.ContainsKey('VlanId') -or -not $rule.VlanId) {
+        throw "Each Access rule must include VlanId."
+    }
+    $nics = @(Get-VMNetworkAdapter -VMName $VMName)
+    $targets = Resolve-Nics-For-Rule -rule $rule -allNics $nics
+    foreach ($nic in $targets) { Apply-AccessRule $nic ([int]$rule.VlanId) }
+}
+
+# Apply Trunk rules
+foreach ($rule in $TrunkRules) {
+    if (-not $rule.ContainsKey('AllowedVlans') -or -not $rule.AllowedVlans) {
+        throw "Each Trunk rule must include AllowedVlans (comma-separated list)."
+    }
+    $native = 0
+    if ($rule.ContainsKey('NativeVlan') -and $null -ne $rule.NativeVlan) {
+        $native = [int]$rule.NativeVlan
+    }
+    $nics = @(Get-VMNetworkAdapter -VMName $VMName)
+    $targets = Resolve-Nics-For-Rule -rule $rule -allNics $nics
+    foreach ($nic in $targets) { Apply-TrunkRule $nic $rule.AllowedVlans $native }
+}
+
+# NIC extras for matched NICs (global)
+foreach ($nic in $allNics) { Apply-NicExtras $nic }
+
+# Final summary
+Write-Section "Final VLAN Summary"
+Get-VMNetworkAdapterVlan -VMName $VMName |
+    Select-Object VMNetworkAdapterName, SwitchName, Mode, AllowedVlanIdList, NativeVlanId, VlanId |
+    Format-Table -AutoSize
+
+Write-Note "Done. Tip: run the script with -WhatIf for a dry run."
+``
