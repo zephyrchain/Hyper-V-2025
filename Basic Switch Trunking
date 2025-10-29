@@ -1,0 +1,40 @@
+<#
+.SYNOPSIS
+    Configures trunking for virtual network adapters on a specified Hyper-V VM.
+.DESCRIPTION
+    This script trunks specified virtual switches for a VM, allowing multiple VLANs.
+    It also displays the current network adapter configuration before and after changes.
+.NOTES
+    File Name      : Configure-VMTrunking.ps1
+    Prerequisites  : Hyper-V module must be available (Run as Administrator)
+#>
+
+# Placeholders: Replace with your values
+$vmName = "RTR-NA-KC01-PFS-02"  # VM name
+$switches = @(
+    @{ Name = "Proxmox"; AllowedVlanIdList = "773,663,883" },
+    @{ Name = "MSFT";    AllowedVlanIdList = "773,663,883" }
+)
+$nativeVlanId = 0  # Native VLAN ID
+
+# Display current network adapter configuration
+Write-Host "Current network adapter configuration for VM: $vmName"
+Get-VMNetworkAdapter -VMName $vmName |
+    Select-Object VMName, SwitchName, Name |
+    Format-Table -AutoSize
+
+# Configure trunking for each specified switch
+foreach ($switch in $switches) {
+    Write-Host "`nConfiguring trunk for switch: $($switch.Name)"
+    Get-VMNetworkAdapter -VMName $vmName |
+        Where-Object SwitchName -EQ $switch.Name |
+        Set-VMNetworkAdapterVlan `
+            -Trunk `
+            -AllowedVlanIdList $switch.AllowedVlanIdList `
+            -NativeVlanId $nativeVlanId
+}
+
+# Display updated network adapter configuration
+Write-Host "`nUpdated network adapter configuration for VM: $vmName"
+Get-VMNetworkAdapterVlan -VMName $vmName |
+    Format-Table VMNetworkAdapterName, SwitchName, Mode, AllowedVlanIdList, NativeVlanId -AutoSize
