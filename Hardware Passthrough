@@ -1,0 +1,19 @@
+<#
+.SYNOPSIS
+    Enables hardware passthrough (virtualization extensions) for a specified Hyper-V VM.
+.DESCRIPTION
+    This script sets the `-ExposeVirtualizationExtensions` flag to $true for a given VM,
+    which is useful for nested virtualization or hardware passthrough scenarios.
+.NOTES
+    File Name      : Enable-VMHardwarePassthrough.ps1
+    Prerequisites  : Hyper-V module must be available (Run as Administrator)
+#>
+
+# Placeholder: Replace with your VM name
+$vmName = "Proxmox 8"
+
+# Enable virtualization extensions for the specified VM
+Set-VMProcessor -VMName $vmName -ExposeVirtualizationExtensions $true
+
+# Optional: Output confirmation
+Write-Host "Hardware passthrough (virtualization extensions) enabled for VM: $vmName"
