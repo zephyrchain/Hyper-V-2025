@@ -1,0 +1,501 @@
+[CmdletBinding(SupportsShouldProcess = $true)]
+param(
+    [Parameter(Mandatory=$false)]
+    [string]$VMName,
+
+    [Parameter(Mandatory=$false)]
+    [ValidateSet('DDA', 'Partition')]
+    [string]$Method = 'DDA'
+)
+
+<#
+.SYNOPSIS
+    Hyper-V GPU Passthrough Configuration Script
+.DESCRIPTION
+    Configures GPU passthrough for Hyper-V VMs using either DDA (Discrete Device Assignment)
+    for Windows Server or GPU Partitioning for Windows 10/11.
+    Based on: https://www.nakivo.com/blog/hyper-v-gpu-passthrough
+.PARAMETER VMName
+    Name of the VM to configure
+.PARAMETER Method
+    DDA (Windows Server) or Partition (Windows 10/11 Client)
+#>
+
+# =========================
+# IMPORTS
+# =========================
+Import-Module Hyper-V -ErrorAction Stop
+
+# =========================
+# USER CONFIGURATION
+# =========================
+$DefaultLowMMIO = 1GB
+$DefaultHighMMIO = 32GB
+$ServerLowMMIO = 3GB
+$ServerHighMMIO = 33280MB
+
+# =========================
+# HELPER FUNCTIONS
+# =========================
+function Write-Title($text) {
+    Write-Host "`n" ("="*80) -ForegroundColor Cyan
+    Write-Host " $text" -ForegroundColor Cyan
+    Write-Host ("="*80) -ForegroundColor Cyan
+}
+
+function Write-Step($text) {
+    Write-Host "`n[STEP] $text" -ForegroundColor Green
+}
+
+function Write-Info($text) {
+    Write-Host "[INFO] $text" -ForegroundColor Yellow
+}
+
+function Write-Success($text) {
+    Write-Host "[SUCCESS] $text" -ForegroundColor Green
+}
+
+function Write-Error2($text) {
+    Write-Host "[ERROR] $text" -ForegroundColor Red
+}
+
+function Test-Administrator {
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Test-HyperVEnabled {
+    try {
+        # Check if Hyper-V services are running
+        $vmms = Get-Service vmms -ErrorAction Stop
+        $vmcompute = Get-Service vmcompute -ErrorAction Stop
+        return ($vmms.Status -eq 'Running' -and $vmcompute.Status -eq 'Running')
+    } catch {
+        return $false
+    }
+}
+
+function Test-IOMMUEnabled {
+    try {
+        $vmHost = Get-VMHost
+        $iovSupport = $vmHost.IovSupport
+        $reasons = $vmHost.IovSupportReasons
+
+        Write-Info "IOMMU/IOV Support: $iovSupport"
+        if (-not $iovSupport -and $reasons) {
+            Write-Info "Reasons: $($reasons -join ', ')"
+        }
+        return $iovSupport
+    } catch {
+        Write-Error2 "Could not check IOMMU status: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-VMChoice {
+    $vms = @(Get-VM | Sort-Object Name)
+    if ($vms.Count -eq 0) {
+        throw "No VMs found on this host."
+    }
+
+    Write-Host "`nAvailable VMs:" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $vms.Count; $i++) {
+        $vm = $vms[$i]
+        Write-Host "  [$($i+1)] $($vm.Name) (State: $($vm.State), Gen: $($vm.Generation))" -ForegroundColor White
+    }
+
+    do {
+        $choice = Read-Host "`nSelect VM number (1-$($vms.Count))"
+        $index = [int]$choice - 1
+    } while ($index -lt 0 -or $index -ge $vms.Count)
+
+    return $vms[$index].Name
+}
+
+function Get-GPUDevices {
+    Write-Step "Detecting GPU devices..."
+
+    $gpus = @()
+    $devices = Get-PnpDevice -Class Display -PresentOnly -Status OK |
+               Where-Object { $_.FriendlyName -match 'NVIDIA|AMD|Intel' }
+
+    foreach ($device in $devices) {
+        try {
+            $locationProp = Get-PnpDeviceProperty -InstanceId $device.InstanceId -KeyName 'DEVPKEY_Device_LocationPaths' -ErrorAction Stop
+            if ($locationProp -and $locationProp.Data -and $locationProp.Data.Count -ge 1) {
+                $locationPath = $locationProp.Data[0]
+
+                if ($locationPath -match '^PCIROOT\([^)]+\)(#PCI\([0-9A-F]+\))*$') {
+                    $gpus += [PSCustomObject]@{
+                        FriendlyName = $device.FriendlyName
+                        InstanceId   = $device.InstanceId
+                        LocationPath = $locationPath
+                        Status       = $device.Status
+                    }
+                }
+            }
+        } catch {
+            continue
+        }
+    }
+
+    return $gpus
+}
+
+function Select-GPU {
+    param([array]$GPUs)
+
+    if ($GPUs.Count -eq 0) {
+        throw "No compatible GPUs found for passthrough."
+    }
+
+    Write-Host "`nAvailable GPUs:" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $GPUs.Count; $i++) {
+        Write-Host "  [$($i+1)] $($GPUs[$i].FriendlyName)" -ForegroundColor White
+        Write-Host "       Location: $($GPUs[$i].LocationPath)" -ForegroundColor DarkGray
+    }
+
+    do {
+        $choice = Read-Host "`nSelect GPU number (1-$($GPUs.Count))"
+        $index = [int]$choice - 1
+    } while ($index -lt 0 -or $index -ge $GPUs.Count)
+
+    return $GPUs[$index]
+}
+
+function Disable-GPUOnHost {
+    param([string]$InstanceId)
+
+    Write-Step "Disabling GPU on host..."
+    try {
+        Disable-PnpDevice -InstanceId $InstanceId -Confirm:$false -ErrorAction Stop
+        Write-Success "GPU disabled successfully"
+    } catch {
+        Write-Error2 "Failed to disable GPU: $($_.Exception.Message)"
+        throw
+    }
+}
+
+function Configure-VMDDA {
+    param(
+        [string]$VMName,
+        [string]$LocationPath,
+        [int64]$LowMMIO,
+        [int64]$HighMMIO
+    )
+
+    Write-Step "Configuring VM for DDA (Discrete Device Assignment)..."
+
+    $vm = Get-VM -Name $VMName -ErrorAction Stop
+
+    # Check VM generation
+    if ($vm.Generation -ne 2) {
+        throw "VM must be Generation 2 for DDA. Current generation: $($vm.Generation)"
+    }
+
+    # Check VM state
+    if ($vm.State -ne 'Off') {
+        Write-Info "VM must be powered off. Current state: $($vm.State)"
+        $shutdown = Read-Host "Shutdown VM now? (Y/N)"
+        if ($shutdown -eq 'Y') {
+            Stop-VM -Name $VMName -Force
+            Write-Success "VM stopped"
+        } else {
+            throw "VM must be stopped to continue"
+        }
+    }
+
+    # Disable automatic checkpoints
+    Write-Info "Disabling automatic checkpoints..."
+    Set-VM -Name $VMName -AutomaticCheckpointsEnabled $false
+    Set-VM -Name $VMName -AutomaticStopAction TurnOff
+
+    # Configure MMIO space
+    Write-Step "Configuring MMIO space..."
+    Write-Info "Low MMIO: $([math]::Round($LowMMIO/1GB, 2)) GB"
+    Write-Info "High MMIO: $([math]::Round($HighMMIO/1GB, 2)) GB"
+
+    Set-VM -Name $VMName -GuestControlledCacheTypes $true
+    Set-VM -Name $VMName -LowMemoryMappedIoSpace $LowMMIO
+    Set-VM -Name $VMName -HighMemoryMappedIoSpace $HighMMIO
+    Write-Success "MMIO configured"
+
+    # Disable Dynamic Memory
+    $memoryStartup = (Get-VMMemory -VMName $VMName).Startup
+    Set-VMMemory -VMName $VMName -DynamicMemoryEnabled $false -StartupBytes $memoryStartup
+    Write-Success "Dynamic Memory disabled"
+
+    # Dismount GPU from host
+    Write-Step "Dismounting GPU from host..."
+    try {
+        Dismount-VMHostAssignableDevice -LocationPath $LocationPath -Force -ErrorAction Stop
+        Write-Success "GPU dismounted from host"
+    } catch {
+        Write-Error2 "Failed to dismount GPU: $($_.Exception.Message)"
+        throw
+    }
+
+    # Assign GPU to VM
+    Write-Step "Assigning GPU to VM..."
+    try {
+        Add-VMAssignableDevice -VMName $VMName -LocationPath $LocationPath -ErrorAction Stop
+        Write-Success "GPU assigned to VM successfully"
+    } catch {
+        Write-Error2 "Failed to assign GPU: $($_.Exception.Message)"
+        # Try to remount on host
+        Mount-VMHostAssignableDevice -LocationPath $LocationPath -ErrorAction SilentlyContinue
+        throw
+    }
+}
+
+function Configure-VMPartition {
+    param(
+        [string]$VMName,
+        [int64]$LowMMIO,
+        [int64]$HighMMIO
+    )
+
+    Write-Step "Configuring VM for GPU Partitioning (Windows 10/11)..."
+
+    # Check for partitionable GPUs
+    try {
+        $partitionableGPUs = Get-VMPartitionableGpu -ErrorAction Stop
+        if ($partitionableGPUs.Count -eq 0) {
+            throw "No partitionable GPUs found. Your GPU may not support partitioning."
+        }
+
+        Write-Success "Found $($partitionableGPUs.Count) partitionable GPU(s)"
+        foreach ($gpu in $partitionableGPUs) {
+            Write-Info "  - $($gpu.Name)"
+        }
+    } catch {
+        Write-Error2 "Failed to detect partitionable GPUs: $($_.Exception.Message)"
+        throw
+    }
+
+    $vm = Get-VM -Name $VMName -ErrorAction Stop
+
+    # Check VM state
+    if ($vm.State -ne 'Off') {
+        Write-Info "VM must be powered off. Current state: $($vm.State)"
+        $shutdown = Read-Host "Shutdown VM now? (Y/N)"
+        if ($shutdown -eq 'Y') {
+            Stop-VM -Name $VMName -Force
+            Write-Success "VM stopped"
+        } else {
+            throw "VM must be stopped to continue"
+        }
+    }
+
+    # Configure VM
+    Write-Step "Configuring VM settings..."
+    Set-VM -VMName $VMName -GuestControlledCacheTypes $true -LowMemoryMappedIoSpace $LowMMIO -HighMemoryMappedIoSpace $HighMMIO
+    Write-Success "MMIO configured"
+
+    # Add GPU partition adapter
+    Write-Step "Adding GPU partition adapter to VM..."
+    try {
+        $gpuAdapter = Get-VMGpuPartitionAdapter -VMName $VMName -ErrorAction SilentlyContinue
+        if (-not $gpuAdapter) {
+            Add-VMGpuPartitionAdapter -VMName $VMName -ErrorAction Stop
+            Write-Success "GPU partition adapter added"
+        } else {
+            Write-Info "GPU partition adapter already exists. Skipping configuration."
+        }
+    } catch {
+        Write-Error2 "Failed to add GPU partition: $($_.Exception.Message)"
+        throw
+    }
+
+    # Instructions for driver installation
+    Write-Host "`n" ("="*80) -ForegroundColor Yellow
+    Write-Host "IMPORTANT: Driver Installation Required" -ForegroundColor Yellow
+    Write-Host ("="*80) -ForegroundColor Yellow
+    Write-Info "You need to copy GPU drivers from host to VM."
+    Write-Info "Recommended tool: Easy-GPU-PV script"
+    Write-Info "Download from: https://github.com/jamesstringerparsec/Easy-GPU-PV"
+    Write-Info ""
+    Write-Info "After downloading, run:"
+    Write-Info "  .\Update-VMGpuPartitionDriver.ps1 -VMName '$VMName' -GPUName 'AUTO'"
+}
+
+function Remove-GPUPassthrough {
+    param(
+        [string]$VMName,
+        [string]$Method
+    )
+
+    Write-Step "Removing GPU passthrough from VM..."
+
+    $vm = Get-VM -Name $VMName -ErrorAction SilentlyContinue
+    if (-not $vm) {
+        throw "VM '$VMName' not found."
+    }
+
+    if ($vm.State -ne 'Off') {
+        Write-Info "Stopping VM..."
+        Stop-VM -Name $VMName -Force
+    }
+
+    if ($Method -eq 'DDA') {
+        $assignedDevices = Get-VMAssignableDevice -VMName $VMName -ErrorAction SilentlyContinue
+
+        if ($assignedDevices) {
+            foreach ($device in $assignedDevices) {
+                $locationPath = $device.LocationPath
+                Write-Info "Removing device: $locationPath"
+
+                Remove-VMAssignableDevice -VMName $VMName -LocationPath $locationPath -ErrorAction Stop
+                Mount-VMHostAssignableDevice -LocationPath $locationPath -ErrorAction Stop
+
+                Write-Success "Device removed and remounted to host"
+            }
+        } else {
+            Write-Info "No assignable devices found on VM"
+        }
+    } elseif ($Method -eq 'Partition') {
+        try {
+            Remove-VMGpuPartitionAdapter -VMName $VMName -ErrorAction Stop
+            Write-Success "GPU partition adapter removed"
+        } catch {
+            Write-Info "No GPU partition adapter found or already removed"
+        }
+    }
+}
+
+function Show-PostConfiguration {
+    Write-Host "`n" ("="*80) -ForegroundColor Green
+    Write-Host "Post-Configuration Steps" -ForegroundColor Green
+    Write-Host ("="*80) -ForegroundColor Green
+
+    Write-Info "1. Start the VM"
+    Write-Info "2. Install GPU drivers in the guest OS"
+    Write-Info "   - Download from NVIDIA, AMD, or Intel official websites"
+    Write-Info "   - DO NOT use Windows Update drivers"
+    Write-Info "3. Verify GPU appears in Device Manager"
+    Write-Info "4. Test GPU functionality with your applications"
+    Write-Info ""
+    Write-Info "Troubleshooting:"
+    Write-Info "- If Error 43 occurs, ensure IOMMU is enabled in BIOS"
+    Write-Info "- If insufficient resources, increase MMIO values"
+    Write-Info "- Check that your GPU supports virtualization (NVIDIA GRID, AMD MxGPU)"
+}
+
+# =========================
+# MAIN SCRIPT
+# =========================
+try {
+    Write-Title "Hyper-V GPU Passthrough Configuration"
+
+    # Check prerequisites
+    if (-not (Test-Administrator)) {
+        throw "This script must be run as Administrator"
+    }
+
+    if (-not (Test-HyperVEnabled)) {
+        throw "Hyper-V is not enabled. Please enable Hyper-V role first."
+    }
+
+    Write-Success "Running as Administrator"
+    Write-Success "Hyper-V is enabled"
+
+    # Check IOMMU
+    Write-Step "Checking IOMMU/IOV support..."
+    if (-not (Test-IOMMUEnabled)) {
+        Write-Host "`nWARNING: IOMMU/IOV not enabled!" -ForegroundColor Red
+        Write-Info "Enable Intel VT-d or AMD-V in BIOS/UEFI settings"
+        $continue = Read-Host "Continue anyway? (Y/N)"
+        if ($continue -ne 'Y') {
+            exit
+        }
+    }
+
+    # Main menu
+    Write-Host "`n"
+    Write-Host "GPU Passthrough Method:" -ForegroundColor Cyan
+    Write-Host "  [1] DDA - Discrete Device Assignment (Windows Server)" -ForegroundColor White
+    Write-Host "  [2] GPU Partition (Windows 10/11 Client)" -ForegroundColor White
+    Write-Host "  [3] Remove GPU Passthrough" -ForegroundColor White
+    Write-Host "  [Q] Quit" -ForegroundColor White
+
+    $choice = Read-Host "`nSelect option"
+
+    if ($choice -eq 'Q') {
+        exit
+    }
+
+    if ($choice -eq '3') {
+        # Remove GPU passthrough
+        if (-not $VMName) {
+            $VMName = Get-VMChoice
+        }
+
+        Write-Host "`nRemove using which method?" -ForegroundColor Yellow
+        Write-Host "  [1] DDA"
+        Write-Host "  [2] Partition"
+        $methodChoice = Read-Host "Select (1-2)"
+        $removeMethod = if ($methodChoice -eq '2') { 'Partition' } else { 'DDA' }
+
+        Remove-GPUPassthrough -VMName $VMName -Method $removeMethod
+        Write-Success "`nGPU passthrough removed successfully!"
+        exit
+    }
+
+    # Select VM
+    if (-not $VMName) {
+        $VMName = Get-VMChoice
+    }
+
+    if ($choice -eq '1') {
+        # DDA Method
+        Write-Title "DDA Configuration"
+
+        # Detect GPUs
+        $gpus = Get-GPUDevices
+        if ($gpus.Count -eq 0) {
+            throw "No compatible PCIe GPUs found"
+        }
+
+        $selectedGPU = Select-GPU -GPUs $gpus
+
+        Write-Host "`nSelected GPU:" -ForegroundColor Green
+        Write-Info "Name: $($selectedGPU.FriendlyName)"
+        Write-Info "Location: $($selectedGPU.LocationPath)"
+
+        $confirm = Read-Host "`nContinue with DDA configuration? (Y/N)"
+        if ($confirm -ne 'Y') {
+            Write-Info "Configuration cancelled"
+            exit
+        }
+
+        # Disable GPU on host
+        Disable-GPUOnHost -InstanceId $selectedGPU.InstanceId
+
+        # Configure VM
+        Configure-VMDDA -VMName $VMName -LocationPath $selectedGPU.LocationPath -LowMMIO $ServerLowMMIO -HighMMIO $ServerHighMMIO
+
+        Write-Success "`nDDA configuration completed!"
+        Show-PostConfiguration
+
+    } elseif ($choice -eq '2') {
+        # GPU Partition Method
+        Write-Title "GPU Partition Configuration"
+
+        Configure-VMPartition -VMName $VMName -LowMMIO $DefaultLowMMIO -HighMMIO $DefaultHighMMIO
+
+        Write-Success "`nGPU Partition configuration completed!"
+        Show-PostConfiguration
+    }
+
+} catch {
+    Write-Host "`n"
+    Write-Error2 "ERROR: $($_.Exception.Message)"
+    Write-Host "`nConfiguration failed. Please check the error message above." -ForegroundColor Red
+    exit 1
+} finally {
+    # Cleanup: Re-enable GPU if it was disabled
+    if ($selectedGPU) {
+        Enable-PnpDevice -InstanceId $selectedGPU.InstanceId -Confirm:$false -ErrorAction SilentlyContinue
+    }
+}
